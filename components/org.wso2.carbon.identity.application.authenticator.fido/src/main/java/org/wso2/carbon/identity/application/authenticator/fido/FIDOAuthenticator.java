@@ -31,6 +31,7 @@ import org.wso2.carbon.identity.application.authentication.framework.Authenticat
 import org.wso2.carbon.identity.application.authentication.framework.LocalApplicationAuthenticator;
 import org.wso2.carbon.identity.application.authentication.framework.config.ConfigurationFacade;
 import org.wso2.carbon.identity.application.authentication.framework.config.model.StepConfig;
+import org.wso2.carbon.identity.application.authentication.framework.context.AuthHistory;
 import org.wso2.carbon.identity.application.authentication.framework.context.AuthenticationContext;
 import org.wso2.carbon.identity.application.authentication.framework.exception.AuthenticationFailedException;
 import org.wso2.carbon.identity.application.authentication.framework.exception.InvalidCredentialsException;
@@ -44,6 +45,7 @@ import org.wso2.carbon.identity.application.authentication.framework.util.Framew
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
 import org.wso2.carbon.identity.application.authenticator.fido.dto.FIDOUser;
 import org.wso2.carbon.identity.application.authenticator.fido.exception.FIDOAuthenticatorServerException;
+import org.wso2.carbon.identity.application.authenticator.fido.internal.FIDOAuthenticatorServiceComponent;
 import org.wso2.carbon.identity.application.authenticator.fido.internal.FIDOAuthenticatorServiceDataHolder;
 import org.wso2.carbon.identity.application.authenticator.fido.u2f.U2FService;
 import org.wso2.carbon.identity.application.authenticator.fido.util.FIDOAuthenticatorConstants;
@@ -55,6 +57,7 @@ import org.wso2.carbon.identity.application.authenticator.fido2.exception.FIDO2A
 import org.wso2.carbon.identity.application.authenticator.fido2.util.Either;
 import org.wso2.carbon.identity.application.common.model.IdentityProvider;
 import org.wso2.carbon.identity.application.common.model.JustInTimeProvisioningConfig;
+import org.wso2.carbon.identity.base.IdentityRuntimeException;
 import org.wso2.carbon.identity.central.log.mgt.utils.LogConstants;
 import org.wso2.carbon.identity.central.log.mgt.utils.LoggerUtils;
 import org.wso2.carbon.identity.core.ServiceURLBuilder;
@@ -63,7 +66,10 @@ import org.wso2.carbon.identity.core.util.IdentityCoreConstants;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.multi.attribute.login.mgt.ResolvedUserResult;
 import org.wso2.carbon.idp.mgt.IdentityProviderManagementException;
+import org.wso2.carbon.user.api.UserRealm;
 import org.wso2.carbon.user.core.UserCoreConstants;
+import org.wso2.carbon.user.core.UserStoreManager;
+import org.wso2.carbon.user.core.common.AbstractUserStoreManager;
 import org.wso2.carbon.user.core.util.UserCoreUtil;
 import org.wso2.carbon.utils.DiagnosticLog;
 import org.wso2.carbon.utils.multitenancy.MultitenantUtils;
@@ -101,6 +107,8 @@ import static org.wso2.carbon.identity.application.authenticator.fido.util.FIDOA
 import static org.wso2.carbon.identity.application.authenticator.fido.util.FIDOAuthenticatorConstants.TOKEN_RESPONSE;
 import static org.wso2.carbon.identity.application.authenticator.fido.util.FIDOAuthenticatorConstants.USER_NAME;
 import static org.wso2.carbon.identity.application.authenticator.fido2.util.FIDOUtil.writeJson;
+import static org.wso2.carbon.user.core.UserCoreConstants.DOMAIN_SEPARATOR;
+import static org.wso2.carbon.user.core.UserCoreConstants.RealmConfig.PROPERTY_DOMAIN_NAME;
 
 /**
  * FIDO U2F Specification based authenticator.
@@ -112,6 +120,7 @@ public class FIDOAuthenticator extends AbstractApplicationAuthenticator
 
     private static FIDOAuthenticator instance = new FIDOAuthenticator();
     private static final String AUTHENTICATOR_MESSAGE = "authenticatorMessage";
+    private static final String VALIDATE_USERNAME_ADAPTIVE_SCRIPT_PARAM = "ValidateUsername";
 
     @Override
     public AuthenticatorFlowStatus process(HttpServletRequest request, HttpServletResponse response,
@@ -149,6 +158,7 @@ public class FIDOAuthenticator extends AbstractApplicationAuthenticator
         }
 
         AuthenticatedUser authenticatedUser = getAuthenticatedUser(context);
+        validateUserStore(context, authenticatedUser, request);
 
         if (authenticatedUser != null) {
 
@@ -1281,6 +1291,86 @@ public class FIDOAuthenticator extends AbstractApplicationAuthenticator
         } catch (IdentityProviderManagementException e) {
             throw new AuthenticationFailedException(
                     String.format("Error occurred while getting IDP: %s from tenant: %s", idpName, tenantDomain));
+        }
+    }
+
+    /**
+     * Validate and set the userstore domain of the authenticated user if the userstore domain is not set.
+     *
+     * @param context           AuthenticationContext.
+     * @param authenticatedUser AuthenticatedUser.
+     * @param request           HttpServletRequest.
+     */
+    private void validateUserStore(AuthenticationContext context,
+                                   AuthenticatedUser authenticatedUser,
+                                   HttpServletRequest request) {
+
+        String validateUsernameAdaptiveParam = getRuntimeParams(context).get(VALIDATE_USERNAME_ADAPTIVE_SCRIPT_PARAM);
+        if (Boolean.parseBoolean(validateUsernameAdaptiveParam)) {
+            return;
+        }
+
+        for (AuthHistory step : context.getAuthenticationStepHistory()) {
+            if (!step.getAuthenticatorName().startsWith("Identifier")) {
+                continue;
+            }
+
+            final String tenantDomain = context.getTenantDomain();
+            final String username = request.getParameter(USER_NAME);
+            if (StringUtils.isBlank(username)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Username parameter is blank; cannot resolve user store domain.");
+                }
+                break;
+            }
+
+            String userStoreDomain = authenticatedUser.getUserStoreDomain();
+            AbstractUserStoreManager userStoreManager = null;
+
+            try {
+                int tenantId = FIDOAuthenticatorServiceComponent.getRealmService()
+                        .getTenantManager().getTenantId(tenantDomain);
+                UserRealm userRealm = FIDOAuthenticatorServiceComponent.getRealmService()
+                        .getTenantUserRealm(tenantId);
+
+                if (userRealm == null) {
+                    log.warn("UserRealm is null for tenant: " + tenantDomain + " (id: " + tenantId + ")");
+                    break;
+                }
+
+                userStoreManager = (AbstractUserStoreManager) userRealm.getUserStoreManager();
+
+                // First try: resolve userId in the primary (or domain-qualified) store.
+                String userId = userStoreManager.getUserIDFromUserName(username);
+
+                // If not found and username is NOT domain-qualified, search secondary stores.
+                if (userId == null && !username.contains(DOMAIN_SEPARATOR)) {
+                    UserStoreManager secondary = userStoreManager.getSecondaryUserStoreManager();
+                    while (secondary != null) {
+                        String domain = secondary.getRealmConfiguration()
+                                .getUserStoreProperties().get(PROPERTY_DOMAIN_NAME);
+                        if (StringUtils.isNotBlank(domain)
+                                && userStoreManager.isExistingUser(domain + DOMAIN_SEPARATOR + username)) {
+                            userStoreDomain = domain;
+                            break;
+                        }
+                        secondary = secondary.getSecondaryUserStoreManager();
+                    }
+                }
+            } catch (IdentityRuntimeException e) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Failed resolving tenant ID or realm for tenant: " + tenantDomain + ", user: " + username, e);
+                }
+            } catch (org.wso2.carbon.user.api.UserStoreException e) {
+                if (log.isDebugEnabled()) {
+                    log.debug("User store operation failed while resolving user store domain for user: " + username, e);
+                }
+            }
+
+            if (StringUtils.isNotBlank(userStoreDomain)) {
+                authenticatedUser.setUserStoreDomain(userStoreDomain);
+            }
+            break;
         }
     }
 }
